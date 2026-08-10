@@ -1096,6 +1096,22 @@ def api_nhac():
     Bắt buộc trên serverless (Vercel) vì không có luồng nền."""
     nhac_deadline()
     kiem_tra_bao_cao_hang_ngay()
+
+    # LƯỚI AN TOÀN (thay change stream trên serverless): vớt tin MỚI (30 phút gần đây)
+    # mà webhook lỡ chưa xử lý. Giới hạn 30' để KHÔNG đụng tin cũ; khóa 'processed' chống trùng.
+    try:
+        moc = datetime.now(timezone.utc) - timedelta(minutes=30)
+        so = 0
+        for tin in messages_col.find(
+            {"processed": {"$ne": True}, "created_at": {"$gte": moc}}
+        ).sort("created_at", 1):
+            xu_ly_tin(tin)
+            so += 1
+        if so:
+            print(f"🛟 Lưới an toàn /nhac: vớt {so} tin lỡ")
+    except Exception as e:
+        print(f"⚠️ Lỗi lưới an toàn /nhac: {e}")
+
     # Dấu vết để kiểm tra cron thật sự đang gọi (mỗi lần gọi cập nhật giờ)
     try:
         update_system({"nhac_lan_cuoi": datetime.now(VN_TZ).isoformat()})
