@@ -1096,6 +1096,11 @@ def api_nhac():
     Bắt buộc trên serverless (Vercel) vì không có luồng nền."""
     nhac_deadline()
     kiem_tra_bao_cao_hang_ngay()
+    # Dấu vết để kiểm tra cron thật sự đang gọi (mỗi lần gọi cập nhật giờ)
+    try:
+        update_system({"nhac_lan_cuoi": datetime.now(VN_TZ).isoformat()})
+    except Exception:
+        pass
     return jsonify({"ok": True})
 
 
