@@ -882,13 +882,34 @@ def _tra_loi_du_lieu(cau_hoi):
         for v in viec
     ) or "(không có việc nào đang chờ)"
 
+    # Lấy LỊCH THẬT trên Google Calendar của sếp (14 ngày trước -> 30 ngày tới).
+    # Bọc an toàn: đọc lỗi/chưa kết nối cũng KHÔNG làm vỡ câu trả lời.
+    lich_txt = "(chưa kết nối Google Calendar)"
+    try:
+        evs = gcal.liet_ke_su_kien(
+            tu_iso=(now - timedelta(days=14)).isoformat(),
+            den_iso=(now + timedelta(days=30)).isoformat(),
+        )
+        if evs:
+            lich_txt = "\n".join(
+                f"- {_fmt(e.get('start',''))}: {e.get('summary','')}"
+                + (f" @ {e.get('location')}" if e.get('location') else "")
+                for e in evs
+            )
+        elif gcal.da_ket_noi():
+            lich_txt = "(không có sự kiện nào trong khoảng 14 ngày trước → 30 ngày tới)"
+    except Exception as e:
+        print(f"⚠️ Lỗi đọc lịch Google cho câu hỏi sếp: {e}")
+
     system = (
         f"Bạn là trợ lý của sếp, bây giờ là {now.strftime('%H:%M %d/%m/%Y')}. "
         "Trả lời câu hỏi của sếp dựa trên dữ liệu dưới đây. "
+        "Khi sếp hỏi về LỊCH/CUỘC HỌP, ưu tiên dùng 'LỊCH GOOGLE CALENDAR' (đây là lịch thật của sếp). "
         "Ngắn gọn, chính xác, bằng tiếng Việt. " + QUY_TAC_XUNG_HO +
         "Nếu không có dữ liệu phù hợp thì nói rõ.\n\n"
-        f"=== TIN NHẮN 7 NGÀY QUA ===\n{tin_txt}\n\n"
-        f"=== VIỆC ĐANG CHỜ ===\n{viec_txt}"
+        f"=== LỊCH GOOGLE CALENDAR CỦA SẾP (14 ngày trước → 30 ngày tới) ===\n{lich_txt}\n\n"
+        f"=== VIỆC ĐANG CHỜ (do bot theo dõi) ===\n{viec_txt}\n\n"
+        f"=== TIN NHẮN 7 NGÀY QUA ===\n{tin_txt}"
     )
     try:
         # Ghép: system + lịch sử hội thoại (trí nhớ) + câu hỏi mới

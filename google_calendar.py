@@ -247,3 +247,45 @@ def huy_su_kien(event_id, user=None):
         return {"success": r.status_code in (200, 204)}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ==================== ĐỌC DANH SÁCH SỰ KIỆN (để trả lời sếp hỏi lịch) ====================
+def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None):
+    """Đọc các sự kiện trên Google Calendar của sếp trong khoảng [tu_iso, den_iso].
+    Trả về list dict {summary, start, end, location}. Luôn trả list (rỗng nếu lỗi/chưa
+    kết nối) — KHÔNG raise, để chỗ gọi không bao giờ vỡ."""
+    if not (da_cau_hinh() and da_ket_noi(user)):
+        return []
+    try:
+        params = {
+            "singleEvents": "true", "orderBy": "startTime",
+            "maxResults": str(gioi_han), "timeZone": "Asia/Ho_Chi_Minh",
+        }
+        if tu_iso:
+            params["timeMin"] = _iso(tu_iso)
+        if den_iso:
+            params["timeMax"] = _iso(den_iso)
+        r = requests.get(
+            f"{API}/calendars/{CALENDAR_ID}/events",
+            headers=_headers(user), params=params, timeout=15,
+        )
+        data = r.json()
+        if data.get("error"):
+            print(f"⚠️ Lỗi đọc lịch Google: {data.get('error')}")
+            return []
+        out = []
+        for e in data.get("items", []):
+            if e.get("status") == "cancelled":
+                continue
+            s = e.get("start", {}) or {}
+            en = e.get("end", {}) or {}
+            out.append({
+                "summary": e.get("summary", "(không tiêu đề)"),
+                "start": s.get("dateTime") or s.get("date"),
+                "end": en.get("dateTime") or en.get("date"),
+                "location": e.get("location", ""),
+            })
+        return out
+    except Exception as e:
+        print(f"⚠️ Lỗi liet_ke_su_kien: {e}")
+        return []
