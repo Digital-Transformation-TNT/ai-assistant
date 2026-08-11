@@ -77,6 +77,7 @@ chat_history_col = db["chat_history"]   # trí nhớ hội thoại của sếp
 pending_bookings_col = db["pending_bookings"]  # lịch họp đang chờ người đặt cung cấp email
 known_contacts_col = db["known_contacts"]  # nhớ email theo từng người, để lần sau không hỏi lại
 google_tokens_col = db["google_tokens"]    # refresh_token Google (kết nối 1 lần, dùng mãi)
+reminded_events_col = db["reminded_events"]  # nhớ event Google đã nhắc, tránh nhắc trùng
 gcal.init(db)
 client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL or None) if AI_API_KEY else None
 print(f"🤖 AI: model={AI_MODEL} | endpoint={AI_BASE_URL or 'OpenAI mặc định'} | key={'có' if AI_API_KEY else 'THIẾU'}")
@@ -888,7 +889,7 @@ def _tra_loi_du_lieu(cau_hoi):
     try:
         evs = gcal.liet_ke_su_kien(
             tu_iso=(now - timedelta(days=14)).isoformat(),
-            den_iso=(now + timedelta(days=30)).isoformat(),
+            den_iso=(now + timedelta(days=60)).isoformat(),
         )
         if evs:
             lich_txt = "\n".join(
@@ -901,14 +902,19 @@ def _tra_loi_du_lieu(cau_hoi):
     except Exception as e:
         print(f"⚠️ Lỗi đọc lịch Google cho câu hỏi sếp: {e}")
 
+    thu = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"][now.weekday()]
     system = (
-        f"Bạn là trợ lý của sếp, bây giờ là {now.strftime('%H:%M %d/%m/%Y')}. "
-        "Trả lời câu hỏi của sếp dựa trên dữ liệu dưới đây. "
-        "Khi sếp hỏi về LỊCH/CUỘC HỌP, ưu tiên dùng 'LỊCH GOOGLE CALENDAR' (đây là lịch thật của sếp). "
-        "Ngắn gọn, chính xác, bằng tiếng Việt. " + QUY_TAC_XUNG_HO +
-        "Nếu không có dữ liệu phù hợp thì nói rõ.\n\n"
-        f"=== LỊCH GOOGLE CALENDAR CỦA SẾP (14 ngày trước → 30 ngày tới) ===\n{lich_txt}\n\n"
-        f"=== VIỆC ĐANG CHỜ (do bot theo dõi) ===\n{viec_txt}\n\n"
+        f"Bạn là trợ lý của sếp. Bây giờ là {now.strftime('%H:%M')} {thu} ngày {now.strftime('%d/%m/%Y')}. "
+        "Trả lời câu hỏi của sếp dựa trên dữ liệu dưới đây.\n"
+        "CÁCH TRẢ LỜI THÔNG MINH:\n"
+        "- Hiểu đúng khoảng thời gian sếp hỏi (hôm nay / ngày mai / tuần này / tuần sau / tháng 8...) "
+        "và CHỈ nêu đúng khoảng đó, không liệt kê thừa các mốc ngoài phạm vi.\n"
+        "- Về LỊCH/HỌP: dùng 'LỊCH GOOGLE CALENDAR' (lịch thật của sếp). Sắp xếp theo thời gian, "
+        "gom theo từng ngày, ghi rõ giờ + tên + địa điểm (nếu có).\n"
+        "- Nếu khoảng sếp hỏi không có sự kiện nào thì nói rõ 'khoảng đó sếp không có lịch'.\n"
+        "- Bỏ qua các mục trùng lặp. Ngắn gọn, đúng trọng tâm, tiếng Việt. " + QUY_TAC_XUNG_HO + "\n\n"
+        f"=== LỊCH GOOGLE CALENDAR CỦA SẾP (14 ngày trước → 60 ngày tới) ===\n{lich_txt}\n\n"
+        f"=== VIỆC ĐANG CHỜ (do bot theo dõi trong hệ thống) ===\n{viec_txt}\n\n"
         f"=== TIN NHẮN 7 NGÀY QUA ===\n{tin_txt}"
     )
     try:
@@ -976,6 +982,65 @@ def nhac_deadline():
                 gui_sep(_soan_loi_nhac(v, con_phut, "som"))
                 print(f"🔔 Nhắc SỚM: {v['viec']}")
 
+    # Nhắc luôn các cuộc họp trên Google Calendar (lịch sếp tự thêm, không tạo qua bot)
+    try:
+        nhac_lich_google()
+    except Exception as e:
+        print(f"⚠️ Lỗi nhắc lịch Google: {e}")
+
+
+def nhac_lich_google():
+    """Nhắc sếp các cuộc họp SẮP TỚI trên Google Calendar (kể cả lịch không tạo qua bot).
+    Chống nhắc trùng bằng collection reminded_events (khóa atomic theo event id)."""
+    if not (gcal.da_cau_hinh() and gcal.da_ket_noi()):
+        return
+    sys = get_system()
+    phut_truoc = int(sys.get("phut_nhac_truoc", PHUT_NHAC_TRUOC_DEFAULT))
+    now = datetime.now(VN_TZ)
+    # Nhìn trước = phút nhắc + 1 chu kỳ quét, để không lọt event nào giữa 2 lượt cron
+    cua_so = phut_truoc + CRON_INTERVAL_MIN
+    evs = gcal.liet_ke_su_kien(
+        tu_iso=now.isoformat(),
+        den_iso=(now + timedelta(minutes=cua_so)).isoformat(),
+    )
+    for e in evs:
+        if e.get("ca_ngay"):   # bỏ sự kiện cả ngày (lễ, sinh nhật... không nhắc kiểu 15 phút)
+            continue
+        start = e.get("start")
+        try:
+            bd = datetime.fromisoformat(start)
+        except Exception:
+            continue
+        con = int((bd - now).total_seconds() / 60)
+        if con < 0:            # đã bắt đầu -> bỏ
+            continue
+        khoa = e.get("id") or f"{start}|{e.get('summary','')}"
+        # Khóa atomic: chỉ nhắc nếu chưa từng nhắc event này
+        locked = reminded_events_col.update_one(
+            {"_id": khoa},
+            {"$setOnInsert": {"_id": khoa, "start": start,
+                              "reminded_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        if locked.upserted_id is None:
+            continue           # đã nhắc rồi
+        dia_diem = f"\nĐịa điểm: {e.get('location')}" if e.get("location") else ""
+        gui_sep(
+            f"🔔 TingTing nhắc sếp sắp có lịch ạ!\n"
+            f"Nội dung: {e.get('summary','')}\n"
+            f"Bắt đầu: {_fmt(start)} (còn ~{con} phút){dia_diem}\n"
+            f"Sếp sắp xếp có mặt nhé, chúc sếp họp vui vẻ ạ! 😊"
+        )
+        print(f"🔔 Nhắc lịch Google: {e.get('summary')} ({con}')")
+
+    # Dọn bản ghi nhắc cũ (> 7 ngày) cho gọn
+    try:
+        reminded_events_col.delete_many(
+            {"reminded_at": {"$lt": datetime.now(timezone.utc) - timedelta(days=7)}}
+        )
+    except Exception:
+        pass
+
 
 def _soan_loi_nhac(v, con_phut, muc):
     """Soạn lời nhắc thân thiện theo loại việc (họp / công việc)."""
@@ -1037,17 +1102,36 @@ def _soan_bao_cao(sys):
         f"- {v.get('viec','')} (hạn {_fmt(v.get('deadline',''))})" for v in viec
     ) or "(không có việc nào đang chờ)"
 
-    if not client:
-        return f"📋 Báo cáo hôm nay:\nViệc đang chờ:\n{viec_txt}"
+    # Lịch HÔM NAY trên Google Calendar (từ đầu ngày -> cuối ngày). Bọc an toàn.
+    lich_hom_nay = "(chưa kết nối Google Calendar)"
+    try:
+        dau_ngay = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        cuoi_ngay = now.replace(hour=23, minute=59, second=59, microsecond=0)
+        evs = gcal.liet_ke_su_kien(tu_iso=dau_ngay.isoformat(), den_iso=cuoi_ngay.isoformat())
+        if evs:
+            lich_hom_nay = "\n".join(
+                f"- {_fmt(e.get('start',''))}: {e.get('summary','')}"
+                + (f" @ {e.get('location')}" if e.get('location') else "")
+                for e in evs
+            )
+        elif gcal.da_ket_noi():
+            lich_hom_nay = "(hôm nay không có lịch nào trên Google Calendar)"
+    except Exception as e:
+        print(f"⚠️ Lỗi đọc lịch Google cho báo cáo sáng: {e}")
 
+    if not client:
+        return f"📋 Báo cáo sáng:\nLịch hôm nay:\n{lich_hom_nay}\n\nViệc đang chờ:\n{viec_txt}"
+
+    thu = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"][now.weekday()]
     system = (
-        f"Bạn là trợ lý cá nhân của sếp. Bây giờ là {now.strftime('%H:%M %d/%m/%Y')}.\n"
+        f"Bạn là trợ lý cá nhân của sếp. Bây giờ là {now.strftime('%H:%M')} {thu} ngày {now.strftime('%d/%m/%Y')}.\n"
         f"Quy tắc/phong cách:\n{sys.get('noi_dung','')}\n\n"
-        "Soạn một BÁO CÁO SÁNG cho sếp, gồm: tổng hợp các việc đang chờ + việc sắp tới hạn, "
-        "kèm lời chào ấm áp, quan tâm sức khỏe. Ngắn gọn, tự nhiên, tiếng Việt, không markdown. "
-        + QUY_TAC_XUNG_HO
+        "Soạn BÁO CÁO SÁNG cho sếp, gồm 2 phần: (1) LỊCH HÔM NAY của sếp (từ Google Calendar, "
+        "liệt kê theo giờ, kèm địa điểm nếu có); (2) việc đang chờ / sắp tới hạn. "
+        "Mở đầu bằng lời chào ấm áp, quan tâm sức khỏe. Kết bằng lời chúc ngày làm việc tốt. "
+        "Ngắn gọn, tự nhiên, tiếng Việt, KHÔNG markdown. " + QUY_TAC_XUNG_HO
     )
-    user = f"Danh sách việc đang chờ:\n{viec_txt}"
+    user = f"LỊCH HÔM NAY (Google Calendar):\n{lich_hom_nay}\n\nVIỆC ĐANG CHỜ:\n{viec_txt}"
     try:
         r = client.chat.completions.create(
             model=AI_MODEL,

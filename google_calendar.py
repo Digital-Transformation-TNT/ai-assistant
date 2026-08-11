@@ -280,10 +280,12 @@ def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None):
             s = e.get("start", {}) or {}
             en = e.get("end", {}) or {}
             out.append({
+                "id": e.get("id"),
                 "summary": e.get("summary", "(không tiêu đề)"),
                 "start": s.get("dateTime") or s.get("date"),
                 "end": en.get("dateTime") or en.get("date"),
                 "location": e.get("location", ""),
+                "ca_ngay": "date" in s,   # sự kiện cả ngày (không có giờ cụ thể)
             })
         return out
     except Exception as e:
