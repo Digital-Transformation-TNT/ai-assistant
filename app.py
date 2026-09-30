@@ -6,6 +6,7 @@ Gộp 3 con vào chung 1 process:
   - Nhận tin Lark   (cũ: lark-message-bot-main)  -> POST /lark-webhook
   - Nhận tin Zalo   (cũ: zalo-bot-main)          -> POST /webhook
   - Trợ lý xử lý    (assistant.py, dùng lại nguyên) -> tạo/sửa/xóa lịch, nhắc, Google Calendar
+  - Lịch Lark đổi   (lark_calendar.py)             -> cùng POST /lark-webhook, đồng bộ sang Google
 
 Khác bản cũ: webhook nhận tin -> LƯU Mongo + gọi THẲNG xu_ly_tin() cùng process,
 không gọi chéo qua mạng nữa (bỏ mắt xích từng gây lỗi).
@@ -136,6 +137,16 @@ def lark_webhook():
     # (A) Xác thực URL lúc cấu hình (Lark gửi challenge)
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
+
+    # (A2) Sếp sửa/thêm/xoá lịch thẳng trên giao diện Lark Calendar -> đồng bộ sang Google.
+    #      (Payload không kèm chi tiết, chỉ báo "có thay đổi" -> bot tự đọc phần thay đổi.)
+    if data.get("header", {}).get("event_type") == "calendar.calendar.event.changed_v4":
+        print("📆 [Lark] Lịch thay đổi -> đồng bộ sang Google Calendar")
+        if CHAY_NEN:
+            threading.Thread(target=assistant.dong_bo_lark_sang_google, daemon=True).start()
+        else:
+            assistant.dong_bo_lark_sang_google()
+        return jsonify({"code": 0}), 200
 
     # (B) Sự kiện có người nhắn tin
     if data.get("header", {}).get("event_type") == "im.message.receive_v1":

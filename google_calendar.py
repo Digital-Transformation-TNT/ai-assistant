@@ -99,6 +99,15 @@ def doi_code_lay_token(code, user=None):
 
 
 # ==================== BƯỚC 3: LẤY ACCESS TOKEN (tự làm mới) ====================
+class LoiXacThucGoogle(RuntimeError):
+    """Token Google hỏng/hết hạn/bị thu hồi -> sếp phải vào /auth-google cấp quyền lại.
+    Hay gặp nhất: app OAuth để chế độ 'Testing' -> refresh_token chết sau 7 ngày."""
+
+
+# Google trả các mã này khi refresh_token không dùng được nữa (phải cấp quyền lại)
+_LOI_TOKEN_CHET = ("invalid_grant", "unauthorized_client", "invalid_client")
+
+
 def _access_token(user=None):
     user = user or GOOGLE_CAL_USER
     tok, het_han = _cache.get(user, (None, 0))
@@ -107,7 +116,7 @@ def _access_token(user=None):
 
     row = _tokens_col.find_one({"_id": user}) if _tokens_col is not None else None
     if not row or not row.get("refresh_token"):
-        raise RuntimeError(f"Chưa kết nối Google cho user '{user}'. Vào /auth-google một lần.")
+        raise LoiXacThucGoogle(f"Chưa kết nối Google cho user '{user}'. Vào /auth-google một lần.")
 
     r = requests.post(TOKEN_URL, data={
         "refresh_token": row["refresh_token"],
@@ -117,6 +126,9 @@ def _access_token(user=None):
     }, timeout=15)
     data = r.json()
     if not data.get("access_token"):
+        if data.get("error") in _LOI_TOKEN_CHET:
+            raise LoiXacThucGoogle(f"Token Google hết hạn/bị thu hồi ({data.get('error')}). "
+                                   "Vào /auth-google cấp quyền lại.")
         raise RuntimeError(f"Không làm mới được token Google: {data}")
 
     tok = data["access_token"]
@@ -124,16 +136,49 @@ def _access_token(user=None):
     return tok
 
 
+def kiem_tra_ket_noi(user=None):
+    """Thử lấy access token THẬT (không chỉ xem có lưu token trong Mongo không).
+    Trả (True, None) nếu dùng được, (False, 'lý do') nếu không."""
+    if not da_cau_hinh():
+        return False, "Chưa cấu hình GOOGLE_CLIENT_ID / SECRET / REDIRECT_URI"
+    try:
+        _access_token(user)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def _headers(user=None):
     return {"Authorization": f"Bearer {_access_token(user)}",
             "Content-Type": "application/json"}
+
+
+def _goi(method, path, user=None, params=None, json_body=None, timeout=20):
+    """Gọi Google Calendar API. Trả (status_code, data). Tự thử lại 1 lần nếu 401."""
+    for lan in range(2):
+        r = requests.request(method, f"{API}{path}", headers=_headers(user),
+                             params=params, json=json_body, timeout=timeout)
+        if r.status_code == 401 and lan == 0:
+            _cache.pop(user or GOOGLE_CAL_USER, None)   # access token cũ hỏng -> lấy lại
+            continue
+        break
+    try:
+        data = r.json() if r.content else {}
+    except ValueError:
+        data = {"raw": r.text[:300]}
+    return r.status_code, data
+
+
+def _loi(e):
+    """Đổi exception thành dict lỗi thống nhất (auth=True nếu cần cấp quyền lại)."""
+    return {"error": str(e), "auth": isinstance(e, LoiXacThucGoogle)}
 
 
 def _iso(x):
     """Chấp nhận ISO8601 hoặc timestamp -> chuỗi ISO có offset +07:00."""
     if isinstance(x, (int, float)):
         return datetime.fromtimestamp(x, VN_TZ).isoformat()
-    dt = datetime.fromisoformat(str(x))
+    dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=VN_TZ)
     return dt.isoformat()
@@ -143,17 +188,13 @@ def _iso(x):
 def bi_trung_lich(bat_dau_iso, ket_thuc_iso, user=None):
     """True nếu sếp đã có việc khác trong khung giờ đó."""
     try:
-        r = requests.post(
-            f"{API}/freeBusy",
-            headers=_headers(user),
-            json={
-                "timeMin": _iso(bat_dau_iso),
-                "timeMax": _iso(ket_thuc_iso),
-                "timeZone": "Asia/Ho_Chi_Minh",
-                "items": [{"id": CALENDAR_ID}],
-            }, timeout=15,
-        )
-        busy = r.json().get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
+        st, data = _goi("POST", "/freeBusy", user, json_body={
+            "timeMin": _iso(bat_dau_iso),
+            "timeMax": _iso(ket_thuc_iso),
+            "timeZone": "Asia/Ho_Chi_Minh",
+            "items": [{"id": CALENDAR_ID}],
+        }, timeout=15)
+        busy = data.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
         return len(busy) > 0, busy
     except Exception as e:
         print(f"⚠️ Lỗi check trùng lịch: {e}")
@@ -167,7 +208,7 @@ def tao_su_kien(summary, bat_dau_iso, ket_thuc_iso, description="",
     Tạo sự kiện trên Google Calendar của sếp, mời attendee_email (Google tự gửi mail).
     Trả về dict: {"success": True, "event_id":..., "link":...}
                  {"duplicate": True, "message":...}
-                 {"error": "..."}
+                 {"error": "...", "auth": bool}
     """
     if not da_cau_hinh():
         return {"error": "Chưa cấu hình GOOGLE_CLIENT_ID / SECRET / REDIRECT_URI"}
@@ -199,16 +240,13 @@ def tao_su_kien(summary, bat_dau_iso, ket_thuc_iso, description="",
         if tao_meet:
             params["conferenceDataVersion"] = 1
             body["conferenceData"] = {"createRequest": {
-                "requestId": f"meet-{int(time.time())}",
+                "requestId": f"meet-{time.time_ns()}",
                 "conferenceSolutionKey": {"type": "hangoutsMeet"},
             }}
 
-        r = requests.post(
-            f"{API}/calendars/{CALENDAR_ID}/events",
-            headers=_headers(user), params=params, json=body, timeout=20,
-        )
-        data = r.json()
-        if r.status_code >= 300 or data.get("error"):
+        st, data = _goi("POST", f"/calendars/{CALENDAR_ID}/events", user,
+                        params=params, json_body=body)
+        if st >= 300 or data.get("error"):
             return {"error": data}
 
         return {
@@ -218,43 +256,109 @@ def tao_su_kien(summary, bat_dau_iso, ket_thuc_iso, description="",
             "meet": (data.get("conferenceData", {}) or {}).get("entryPoints", [{}])[0].get("uri"),
         }
     except Exception as e:
-        return {"error": str(e)}
+        return _loi(e)
 
 
 # ==================== ĐỔI GIỜ / HUỶ SỰ KIỆN ====================
-def doi_gio_su_kien(event_id, bat_dau_iso, ket_thuc_iso, user=None):
+def doi_gio_su_kien(event_id, bat_dau_iso, ket_thuc_iso, user=None, send_updates="all"):
+    """Trả {"success": True, "link"} | {"error", "not_found": bool, "auth": bool}.
+    Chỗ gọi PHẢI kiểm tra kết quả (trước đây bỏ qua -> lỗi mà vẫn báo sếp 'đã dời')."""
     try:
-        r = requests.patch(
-            f"{API}/calendars/{CALENDAR_ID}/events/{event_id}",
-            headers=_headers(user), params={"sendUpdates": "all"},
-            json={
-                "start": {"dateTime": _iso(bat_dau_iso), "timeZone": "Asia/Ho_Chi_Minh"},
-                "end": {"dateTime": _iso(ket_thuc_iso), "timeZone": "Asia/Ho_Chi_Minh"},
-            }, timeout=20,
-        )
-        data = r.json()
-        return {"success": True, "link": data.get("htmlLink")} if r.status_code < 300 else {"error": data}
+        st, data = _goi("PATCH", f"/calendars/{CALENDAR_ID}/events/{event_id}", user,
+                        params={"sendUpdates": send_updates},
+                        json_body={
+                            "start": {"dateTime": _iso(bat_dau_iso), "timeZone": "Asia/Ho_Chi_Minh"},
+                            "end": {"dateTime": _iso(ket_thuc_iso), "timeZone": "Asia/Ho_Chi_Minh"},
+                        })
+        if st < 300:
+            return {"success": True, "link": data.get("htmlLink")}
+        return {"error": data, "not_found": st in (404, 410)}
     except Exception as e:
-        return {"error": str(e)}
+        return _loi(e)
 
 
-def huy_su_kien(event_id, user=None):
+def huy_su_kien(event_id, user=None, send_updates="all"):
+    """Xoá sự kiện. Sự kiện đã không còn (404/410) cũng coi là xoá xong."""
     try:
-        r = requests.delete(
-            f"{API}/calendars/{CALENDAR_ID}/events/{event_id}",
-            headers=_headers(user), params={"sendUpdates": "all"}, timeout=20,
-        )
-        return {"success": r.status_code in (200, 204)}
+        st, data = _goi("DELETE", f"/calendars/{CALENDAR_ID}/events/{event_id}", user,
+                        params={"sendUpdates": send_updates})
+        if st in (200, 204, 404, 410):
+            return {"success": True, "da_mat_tu_truoc": st in (404, 410)}
+        return {"error": data}
     except Exception as e:
-        return {"error": str(e)}
+        return _loi(e)
+
+
+# ==================== DÙNG CHO ĐỒNG BỘ LARK -> GOOGLE ====================
+def tao_su_kien_tho(body, user=None, send_updates="none"):
+    """Tạo sự kiện từ body Google đầy đủ (không check trùng, không Meet)."""
+    try:
+        st, data = _goi("POST", f"/calendars/{CALENDAR_ID}/events", user,
+                        params={"sendUpdates": send_updates}, json_body=body)
+        if st < 300:
+            return {"success": True, "event_id": data.get("id"), "link": data.get("htmlLink")}
+        return {"error": data}
+    except Exception as e:
+        return _loi(e)
+
+
+def cap_nhat_su_kien(event_id, body, user=None, send_updates="none"):
+    """PATCH các trường trong body. Trả thêm not_found=True nếu sự kiện đã bị xoá."""
+    try:
+        st, data = _goi("PATCH", f"/calendars/{CALENDAR_ID}/events/{event_id}", user,
+                        params={"sendUpdates": send_updates}, json_body=body)
+        if st < 300 and data.get("status") != "cancelled":
+            return {"success": True, "event_id": data.get("id")}
+        return {"error": data, "not_found": st in (404, 410) or data.get("status") == "cancelled"}
+    except Exception as e:
+        return _loi(e)
+
+
+def tim_theo_thuoc_tinh(khoa, gia_tri, user=None):
+    """Tìm event Google có extendedProperties.private[khoa] == gia_tri. Trả id hoặc None."""
+    st, data = _goi("GET", f"/calendars/{CALENDAR_ID}/events", user, params={
+        "privateExtendedProperty": f"{khoa}={gia_tri}", "maxResults": "5",
+    })
+    if st >= 300:
+        raise RuntimeError(f"Lỗi tìm sự kiện Google: {data}")
+    for e in data.get("items", []):
+        if e.get("status") != "cancelled":
+            return e.get("id")
+    return None
+
+
+def tim_su_kien_trung(summary, bat_dau_iso, ket_thuc_iso, user=None):
+    """Tìm event Google (không lặp) CÙNG tiêu đề + CÙNG giờ bắt đầu. Trả id hoặc None.
+    Dùng khi đồng bộ lần đầu để không nhân đôi lịch sếp đã có sẵn ở cả 2 bên."""
+    bd = datetime.fromisoformat(_iso(bat_dau_iso))
+    st, data = _goi("GET", f"/calendars/{CALENDAR_ID}/events", user, params={
+        "singleEvents": "true", "maxResults": "50",
+        "timeMin": _iso(bat_dau_iso), "timeMax": _iso(ket_thuc_iso),
+    })
+    if st >= 300:
+        raise RuntimeError(f"Lỗi tìm sự kiện Google: {data}")
+    ten = (summary or "").strip().lower()
+    for e in data.get("items", []):
+        if e.get("status") == "cancelled" or e.get("recurringEventId"):
+            continue
+        s = (e.get("start") or {}).get("dateTime")
+        if not s or (e.get("summary") or "").strip().lower() != ten:
+            continue
+        if datetime.fromisoformat(s.replace("Z", "+00:00")) == bd:
+            return e.get("id")
+    return None
 
 
 # ==================== ĐỌC DANH SÁCH SỰ KIỆN (để trả lời sếp hỏi lịch) ====================
-def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None):
+def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None, bao_loi=False):
     """Đọc các sự kiện trên Google Calendar của sếp trong khoảng [tu_iso, den_iso].
-    Trả về list dict {summary, start, end, location}. Luôn trả list (rỗng nếu lỗi/chưa
-    kết nối) — KHÔNG raise, để chỗ gọi không bao giờ vỡ."""
+    Trả về list dict {id, summary, start, end, location, ca_ngay, tu_lark}.
+    - bao_loi=False: lỗi/chưa kết nối -> trả list rỗng (chỗ gọi không bao giờ vỡ).
+    - bao_loi=True : lỗi -> raise, để chỗ gọi báo thật 'lỗi đọc lịch' thay vì nói
+      nhầm là 'sếp không có lịch nào'."""
     if not (da_cau_hinh() and da_ket_noi(user)):
+        if bao_loi:
+            raise LoiXacThucGoogle("Chưa kết nối Google Calendar. Vào /auth-google một lần.")
         return []
     try:
         params = {
@@ -265,20 +369,16 @@ def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None):
             params["timeMin"] = _iso(tu_iso)
         if den_iso:
             params["timeMax"] = _iso(den_iso)
-        r = requests.get(
-            f"{API}/calendars/{CALENDAR_ID}/events",
-            headers=_headers(user), params=params, timeout=15,
-        )
-        data = r.json()
-        if data.get("error"):
-            print(f"⚠️ Lỗi đọc lịch Google: {data.get('error')}")
-            return []
+        st, data = _goi("GET", f"/calendars/{CALENDAR_ID}/events", user, params=params, timeout=15)
+        if st >= 300 or data.get("error"):
+            raise RuntimeError(f"Lỗi đọc lịch Google: {data.get('error', data)}")
         out = []
         for e in data.get("items", []):
             if e.get("status") == "cancelled":
                 continue
             s = e.get("start", {}) or {}
             en = e.get("end", {}) or {}
+            rieng = ((e.get("extendedProperties") or {}).get("private") or {})
             out.append({
                 "id": e.get("id"),
                 "summary": e.get("summary", "(không tiêu đề)"),
@@ -286,8 +386,11 @@ def liet_ke_su_kien(tu_iso=None, den_iso=None, gioi_han=50, user=None):
                 "end": en.get("dateTime") or en.get("date"),
                 "location": e.get("location", ""),
                 "ca_ngay": "date" in s,   # sự kiện cả ngày (không có giờ cụ thể)
+                "tu_lark": bool(rieng.get("lark_event_id")),   # được đồng bộ từ Lark Calendar
             })
         return out
     except Exception as e:
         print(f"⚠️ Lỗi liet_ke_su_kien: {e}")
+        if bao_loi:
+            raise
         return []
