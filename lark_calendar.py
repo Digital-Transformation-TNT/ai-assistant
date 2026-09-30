@@ -96,6 +96,7 @@ def da_ket_noi(user=None):
 def auth_url(user=None):
     params = {
         "client_id": LARK_APP_ID,
+        "app_id": LARK_APP_ID,   # trang đăng nhập Lark bản cũ dùng tên này
         "redirect_uri": LARK_REDIRECT_URI,
         "response_type": "code",
         "scope": LARK_OAUTH_SCOPE,
@@ -129,7 +130,9 @@ def _luu_token(user, data):
     _tokens_col.update_one({"_id": user}, {"$set": upd}, upsert=True)
 
 
-def doi_code_lay_token(code, user=None):
+def doi_code_lay_token(code, user=None, open_id_cho_phep=None):
+    """open_id_cho_phep: open_id của sếp. /auth-lark là link công khai, nên PHẢI kiểm tra
+    người vừa đăng nhập đúng là sếp, không thì lịch của người lạ sẽ bị chép sang Google của sếp."""
     user = user or LARK_CAL_USER
     data = _goi_token({
         "grant_type": "authorization_code",
@@ -138,6 +141,17 @@ def doi_code_lay_token(code, user=None):
         "code": code,
         "redirect_uri": LARK_REDIRECT_URI,
     })
+    if open_id_cho_phep:
+        r = requests.get(f"{LARK_BASE_URL}/open-apis/authen/v1/user_info",
+                         headers={"Authorization": f"Bearer {data['access_token']}"}, timeout=15)
+        try:
+            info = r.json()
+        except ValueError:
+            info = {}
+        open_id = (info.get("data") or {}).get("open_id")
+        if open_id != open_id_cho_phep:
+            raise LoiXacThucLark("Tài khoản Lark vừa đăng nhập KHÔNG phải của sếp, không lưu quyền "
+                                 f"(open_id={open_id or info}).")
     _luu_token(user, data)
     # Cấp quyền lại -> tra lại lịch chính + đăng ký webhook lại
     _tokens_col.update_one({"_id": user}, {"$unset": {"calendar_id": "", "da_dang_ky_webhook": ""}})

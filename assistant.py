@@ -855,8 +855,9 @@ def _doi_lich_hop(mo_ta, gio_moi_iso, gio_ket_thuc_moi_iso=None):
             gg_txt = f"\n⚠️ Nhưng Google Calendar CHƯA đổi được ({_loi_ngan(kq)}), em sẽ tự thử lại."
         else:
             gg_txt = f"\n❌ Google Calendar báo lỗi ({_loi_ngan(kq)}), lịch CHƯA được dời."
-    elif la_viec:
-        # Việc chưa từng lên Google (lúc tạo bị lỗi/trùng giờ) -> đưa lên luôn theo giờ mới
+    elif la_viec and (chon.get("loai_viec") == "hop" or chon.get("nguoi_gui") == "Sếp"):
+        # Lịch họp / lịch sếp tự đặt chưa từng lên Google (lúc tạo bị lỗi/trùng giờ)
+        # -> đưa lên luôn theo giờ mới. (Việc deadline người ngoài gửi thì không đưa lên.)
         tasks_col.update_one({"_id": chon["_id"]}, {"$set": {"can_dong_bo_google": True}})
         gg_txt = "\n📅 Lịch này trước đó chưa lên Google, em sẽ đưa lên theo giờ mới."
 
@@ -1479,7 +1480,7 @@ def lark_oauth_callback():
     if not code:
         return "❌ Thiếu code từ Lark", 400
     try:
-        lark_cal.doi_code_lay_token(code, user)
+        lark_cal.doi_code_lay_token(code, user, open_id_cho_phep=BOSS_OPEN_ID)
     except Exception as e:
         return f"❌ Lỗi kết nối Lark Calendar: {e}", 500
     try:
