@@ -32,6 +32,7 @@ import certifi
 import requests
 from openai import OpenAI
 import google_calendar as gcal
+import lark_calendar as lark_cal
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
@@ -79,6 +80,7 @@ known_contacts_col = db["known_contacts"]  # nhớ email theo từng người, �
 google_tokens_col = db["google_tokens"]    # refresh_token Google (kết nối 1 lần, dùng mãi)
 reminded_events_col = db["reminded_events"]  # nhớ event Google đã nhắc, tránh nhắc trùng
 gcal.init(db)
+lark_cal.init(db)   # đồng bộ Lark Calendar -> Google (lark_tokens, lark_sync, lark_gg_links)
 client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL or None) if AI_API_KEY else None
 print(f"🤖 AI: model={AI_MODEL} | endpoint={AI_BASE_URL or 'OpenAI mặc định'} | key={'có' if AI_API_KEY else 'THIẾU'}")
 
@@ -176,14 +178,52 @@ def gui_sep(text):
 
 
 def _fmt(iso):
+    dt = _parse_iso(iso)
+    return dt.astimezone(VN_TZ).strftime("%H:%M ngày %d/%m") if dt else iso
+
+
+def _parse_iso(s):
+    """ISO8601 -> datetime có múi giờ (thiếu múi giờ thì coi là giờ VN). Lỗi -> None."""
+    if not s:
+        return None
     try:
-        return datetime.fromisoformat(iso).strftime("%H:%M ngày %d/%m")
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except Exception:
-        return iso
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=VN_TZ)
+
+
+def _loi_ngan(kq):
+    """Rút gọn lỗi Google để báo sếp."""
+    loi = kq.get("error") if isinstance(kq, dict) else kq
+    if isinstance(loi, dict):
+        loi = (loi.get("error") or {}).get("message") if isinstance(loi.get("error"), dict) else loi
+    return str(loi)[:150]
+
+
+def _canh_bao_ket_noi(nen_tang, loi):
+    """Token Google/Lark hỏng -> nhắn sếp link cấp quyền lại (tối đa 1 lần / 6 tiếng).
+    Trước đây lỗi token bị nuốt im lặng: bot vẫn báo 'đã dời lịch' mà Google không đổi."""
+    print(f"⚠️ Lỗi kết nối {nen_tang}: {loi}")
+    get_system()   # đảm bảo đã có document settings
+    khoa = f"canh_bao_{nen_tang}_lan_cuoi"
+    now = datetime.now(timezone.utc)
+    r = settings_col.update_one(
+        {"_id": "system", "$or": [{khoa: {"$lt": now - timedelta(hours=6)}},
+                                  {khoa: {"$exists": False}}]},
+        {"$set": {khoa: now}},
+    )
+    if r.modified_count == 0:
+        return
+    duong, ten = ("/auth-google", "Google Calendar") if nen_tang == "google" else ("/auth-lark", "Lark Calendar")
+    link = f"{PUBLIC_URL}{duong}" if PUBLIC_URL else duong
+    gui_sep(f"⚠️ Kết nối {ten} của sếp đang lỗi nên em chưa đồng bộ lịch được ạ "
+            f"({str(loi)[:150]}). Sếp bấm link này cấp quyền lại giúp em nhé: {link}")
 
 
 # ==================== TẠO SỰ KIỆN GOOGLE CALENDAR (khi có người đặt lịch) ====================
-def tao_su_kien_google(summary, bat_dau_iso, ket_thuc_iso, description="", attendee_email=None):
+def tao_su_kien_google(summary, bat_dau_iso, ket_thuc_iso, description="", attendee_email=None,
+                       check_trung=True):
     """
     Tạo sự kiện Google Calendar NGAY TRONG APP NÀY (module google_calendar.py).
     - Tự check trùng lịch (Google freeBusy)
@@ -206,8 +246,11 @@ def tao_su_kien_google(summary, bat_dau_iso, ket_thuc_iso, description="", atten
         summary, bat_dau_iso, ket_thuc_iso,
         description=description,
         attendee_email=attendee_email,
+        check_trung=check_trung,
         tao_meet=True,        # bỏ dòng này nếu không cần link Google Meet
     )
+    if kq.get("auth"):
+        _canh_bao_ket_noi("google", kq.get("error"))
     if kq.get("success"):
         print(f"📅 Đã tạo sự kiện Google Calendar: {kq.get('link')}")
     elif kq.get("duplicate"):
@@ -460,9 +503,18 @@ def _hoan_tat_dat_lich(cho, email):
                 {"_id": ket_qua_luu.upserted_id},
                 {"$set": {"gg_event_id": gg.get("event_id"), "gg_event_link": gg.get("link")}},
             )
+        elif not (gg and gg.get("duplicate")):
+            # Lỗi (token, mạng...) -> đánh dấu để vòng nền tự thử lại
+            tasks_col.update_one({"_id": ket_qua_luu.upserted_id},
+                                 {"$set": {"can_dong_bo_google": True}})
 
-    link_txt = f"\n🔗 Đã lên Google Calendar (đã mời {email}): {gg['link']}" if gg and gg.get("success") else \
-                f"\n⚠️ Chưa mời được qua Google Calendar (email: {email})"
+    da_moi = bool(gg and gg.get("success"))
+    if da_moi:
+        link_txt = f"\n🔗 Đã lên Google Calendar (đã mời {email}): {gg['link']}"
+    elif gg and gg.get("duplicate"):
+        link_txt = f"\n⚠️ Google báo sếp đã có lịch khác trùng giờ nên em CHƯA tạo sự kiện/mời {email}."
+    else:
+        link_txt = f"\n⚠️ Chưa lên được Google Calendar (email: {email}), em sẽ tự thử lại."
 
     # Ghi nhớ email của người này, để lần đặt lịch sau khỏi phải hỏi lại
     _luu_email(platform, cho.get("sender_id"), sender, email)
@@ -471,9 +523,14 @@ def _hoan_tat_dat_lich(cho, email):
     gui_sep(f"🔔 [{platform}] Lịch họp mới từ {sender} ({email}):\n{viec}\n"
             f"🕐 {_fmt(bat_dau_iso)} - {_fmt(ket_thuc_iso)}{link_txt}")
     # Xác nhận với người đặt
-    gui_nguoi_dat(platform, chat_id,
-        f"Dạ em đã chốt lịch họp lúc {_fmt(bat_dau_iso)} và gửi lời mời Google Calendar tới {email} rồi ạ. "
-        "Em cảm ơn anh/chị!")
+    if da_moi:
+        xac_nhan = (f"Dạ em đã chốt lịch họp lúc {_fmt(bat_dau_iso)} và gửi lời mời Google Calendar "
+                    f"tới {email} rồi ạ. Em cảm ơn anh/chị!")
+    else:
+        # Không nói 'đã gửi lời mời' khi thực tế chưa gửi được
+        xac_nhan = (f"Dạ em đã ghi nhận lịch họp lúc {_fmt(bat_dau_iso)} và báo sếp rồi ạ. "
+                    f"Lời mời Google Calendar tới {email} em sẽ gửi ngay khi sếp xác nhận. Em cảm ơn anh/chị!")
+    gui_nguoi_dat(platform, chat_id, xac_nhan)
     print(f"✅ Đã hoàn tất đặt lịch (có email): {viec} - {email}")
 
 
@@ -494,7 +551,8 @@ def _thu_xu_ly_lenh(text):
         "- 'doi_luat': sếp ra lệnh thay đổi quy tắc (đổi giờ báo cáo, phút nhắc, thêm quy tắc...)\n"
         "- 'hoi_du_lieu': sếp hỏi thông tin/thống kê (ai nhắn gì, việc nào tới hạn, tổng hợp...)\n"
         "- 'danh_dau_xong': sếp báo đã hoàn thành một việc (vd 'việc báo cáo xong rồi', 'làm xong họp team')\n"
-        "- 'doi_lich': sếp muốn ĐỔI/LÙI giờ một cuộc họp (vd 'lùi lịch họp với Long sang 14h', 'dời cuộc họp 12h sang 15h')\n"
+        "- 'doi_lich': sếp muốn ĐỔI/SỬA/LÙI/CHUYỂN giờ một lịch/cuộc họp đã có (vd 'lùi lịch họp với Long sang 14h', "
+        "'dời cuộc họp 12h sang 15h', 'sửa lịch test thành 16h-17h', 'chuyển họp GIP sang sáng thứ 2')\n"
         "- 'huy_lich': sếp muốn HỦY/XÓA một lịch/cuộc họp (vd 'hủy lịch họp với GIP', 'xóa cuộc họp 3h chiều', 'bỏ lịch họp mai giúp tôi')\n"
         "- 'quen_di': sếp muốn xóa lịch sử trò chuyện (vd 'quên hết đi', 'bắt đầu lại', 'reset')\n"
         "- 'khac': trò chuyện thường\n"
@@ -508,7 +566,8 @@ def _thu_xu_ly_lenh(text):
         "phut_nhac_truoc (số), xac_nhan (câu xác nhận ấm áp).\n"
         "Nếu 'danh_dau_xong', thêm: mo_ta_viec (mô tả việc sếp báo xong, để tìm trong danh sách).\n"
         "Nếu 'doi_lich', thêm: mo_ta_lich (mô tả cuộc họp cần đổi - tên người hoặc giờ cũ), "
-        "gio_moi_iso (giờ mới bắt đầu dạng ISO8601 +07:00).\n"
+        "gio_moi_iso (giờ mới bắt đầu dạng ISO8601 +07:00), "
+        "gio_ket_thuc_moi_iso (giờ kết thúc mới ISO8601 +07:00 nếu sếp nói rõ, không thì null).\n"
         "Nếu 'huy_lich', thêm: mo_ta_lich (mô tả lịch cần hủy - tên người hoặc giờ).\n"
         "CHỈ trả JSON."
     )
@@ -548,7 +607,8 @@ def _thu_xu_ly_lenh(text):
             _danh_dau_viec_xong(mo_ta)
 
         elif loai == "doi_lich":
-            _doi_lich_hop(kq.get("mo_ta_lich", ""), kq.get("gio_moi_iso"))
+            _doi_lich_hop(kq.get("mo_ta_lich", ""), kq.get("gio_moi_iso"),
+                          kq.get("gio_ket_thuc_moi_iso"))
 
         elif loai == "huy_lich":
             _huy_lich_hop(kq.get("mo_ta_lich", ""))
@@ -614,21 +674,29 @@ def _tao_lich_cho_sep(kq):
         return
 
     # --- ĐẨY LÊN GOOGLE CALENDAR CỦA SẾP (đúng giờ bắt đầu/kết thúc) ---
+    # Sếp tự đặt thì LUÔN tạo (trước đây trùng giờ là bỏ luôn, lịch không bao giờ lên Google);
+    # trùng giờ chỉ cảnh báo thêm.
     link_txt = ""
     if gcal.da_cau_hinh():
         if gcal.da_ket_noi():
-            gg = tao_su_kien_google(viec, bd_iso, kt_iso, description="Sếp tự đặt qua trợ lý")
+            trung, _ = gcal.bi_trung_lich(bd_iso, kt_iso)
+            gg = tao_su_kien_google(viec, bd_iso, kt_iso, description="Sếp tự đặt qua trợ lý",
+                                    check_trung=False)
             if gg and gg.get("success"):
                 tasks_col.update_one({"_id": luu.upserted_id},
                                      {"$set": {"gg_event_id": gg.get("event_id"),
                                                "gg_event_link": gg.get("link")}})
                 link_txt = "\n📅 Đã thêm vào Google Calendar của sếp rồi ạ."
-            elif gg and gg.get("duplicate"):
-                link_txt = "\n📅 (Google Calendar báo sếp đã có lịch khác trùng khung giờ này.)"
+                if trung:
+                    link_txt += "\n⚠️ Lưu ý: khung giờ này sếp đang có lịch khác trên Google Calendar."
             else:
-                link_txt = "\n⚠️ Em ghi vào lịch rồi nhưng chưa đưa lên Google Calendar được, em sẽ thử lại sau ạ."
+                tasks_col.update_one({"_id": luu.upserted_id}, {"$set": {"can_dong_bo_google": True}})
+                link_txt = ("\n⚠️ Em ghi vào lịch rồi nhưng chưa đưa lên Google Calendar được "
+                            f"({_loi_ngan(gg or {})}), em sẽ tự thử lại ạ.")
         else:
-            # Chưa cấp quyền Google -> tao_su_kien_google sẽ tự gửi link cho sếp; ở đây chỉ nhắc thêm
+            # Chưa cấp quyền Google -> tao_su_kien_google sẽ tự gửi link cho sếp; cấp quyền xong
+            # vòng nền sẽ tự đưa lịch này lên Google.
+            tasks_col.update_one({"_id": luu.upserted_id}, {"$set": {"can_dong_bo_google": True}})
             tao_su_kien_google(viec, bd_iso, kt_iso)
             link_txt = "\n⚠️ Để lịch tự lên Google Calendar, sếp bấm link cấp quyền em vừa gửi giúp em nhé ạ."
 
@@ -710,84 +778,113 @@ def _danh_dau_viec_xong(mo_ta):
     gui_sep(f"Dạ em chưa rõ sếp báo xong việc nào. Các việc đang chờ:\n{ds_txt}\nSếp nói rõ hơn giúp em nhé ạ.")
 
 
-def _doi_lich_hop(mo_ta, gio_moi_iso):
-    """Sếp lùi/đổi giờ họp. Cập nhật lịch + báo người đặt + xác nhận sếp."""
-    if not gio_moi_iso:
+def _ung_vien_lich():
+    """Các lịch sếp có thể muốn dời/huỷ: việc bot đang theo dõi + sự kiện Google sắp tới
+    CHƯA gắn với việc nào (lịch sếp tự thêm trên Google, hoặc đồng bộ từ Lark).
+    Trước đây chỉ tìm trong tasks nên lịch không do bot tạo thì không sửa được."""
+    ds = list(tasks_col.find({"hoan_thanh": False}))
+    da_co = {v.get("gg_event_id") for v in ds if v.get("gg_event_id")}
+    now = datetime.now(VN_TZ)
+    evs = gcal.liet_ke_su_kien(tu_iso=(now - timedelta(hours=12)).isoformat(),
+                               den_iso=(now + timedelta(days=60)).isoformat(), gioi_han=100)
+    for e in evs:
+        if e.get("ca_ngay") or e.get("id") in da_co:
+            continue
+        ds.append({
+            "_nguon": "google", "gg_event_id": e.get("id"),
+            "viec": e.get("summary", ""), "bat_dau": e.get("start"), "ket_thuc": e.get("end"),
+            "nguoi_gui": "Lark Calendar" if e.get("tu_lark") else "Google Calendar",
+            "tu_lark": e.get("tu_lark"),
+        })
+    return ds
+
+
+def _doi_lich_hop(mo_ta, gio_moi_iso, gio_ket_thuc_moi_iso=None):
+    """Sếp lùi/đổi giờ họp. Cập nhật lịch + Google Calendar + báo người đặt + xác nhận sếp.
+    Chỉ báo 'đã dời trên Google' khi Google THỰC SỰ trả thành công."""
+    bd_moi = _parse_iso(gio_moi_iso)
+    if not bd_moi:
         gui_sep("Dạ sếp cho em biết giờ mới cụ thể để em dời lịch nhé ạ (vd 'dời sang 14h').")
         return
 
-    ds_hop = list(tasks_col.find({"hoan_thanh": False}))
-    if not ds_hop:
+    ds = _ung_vien_lich()
+    if not ds:
         gui_sep("Dạ hiện không có lịch nào để dời ạ.")
         return
 
-    chon = None
-    if client and mo_ta:
-        ds = "\n".join(
-            f"{i}. {v.get('viec','')} (bắt đầu {_fmt(v.get('bat_dau',''))}, từ {v.get('nguoi_gui','?')})"
-            for i, v in enumerate(ds_hop)
-        )
-        try:
-            r = client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                        "Sếp muốn dời một cuộc họp. Chọn SỐ THỨ TỰ cuộc họp khớp nhất với mô tả. "
-                        "Trả JSON {chi_so: số, chac_chan: bool}."
-                    )},
-                    {"role": "user", "content": f"Mô tả: {mo_ta}\n\nDanh sách:\n{ds}"},
-                ],
-                response_format={"type": "json_object"},
-            )
-            k = json.loads(r.choices[0].message.content)
-            idx = k.get("chi_so")
-            if k.get("chac_chan") and idx is not None and 0 <= idx < len(ds_hop):
-                chon = ds_hop[idx]
-        except Exception as e:
-            print(f"⚠️ Lỗi chọn lịch: {e}")
-
-    if not chon and len(ds_hop) == 1:
-        chon = ds_hop[0]
-
+    chon = _chon_lich_theo_mo_ta(mo_ta, ds)
     if not chon:
-        ds_txt = "\n".join(f"- {v.get('viec','')} ({_fmt(v.get('bat_dau',''))})" for v in ds_hop)
-        gui_sep(f"Dạ em chưa rõ sếp muốn dời lịch nào. Các lịch họp hiện có:\n{ds_txt}\nSếp nói rõ hơn giúp em ạ.")
+        ds_txt = "\n".join(f"- {v.get('viec','')} ({_fmt(v.get('bat_dau', v.get('deadline','')))})" for v in ds)
+        gui_sep(f"Dạ em chưa rõ sếp muốn dời lịch nào. Các lịch hiện có:\n{ds_txt}\nSếp nói rõ hơn giúp em ạ.")
         return
 
-    gio_cu = chon.get("bat_dau", "")
-    try:
-        bd_cu = datetime.fromisoformat(gio_cu)
-        kt_cu = datetime.fromisoformat(chon.get("ket_thuc", gio_cu))
-        thoi_luong = kt_cu - bd_cu
-        bd_moi = datetime.fromisoformat(gio_moi_iso)
+    # Giữ nguyên thời lượng cũ (thiếu giờ kết thúc -> mặc định THOI_LUONG_MAC_DINH_PHUT)
+    gio_cu = chon.get("bat_dau") or chon.get("deadline") or ""
+    bd_cu, kt_cu = _parse_iso(gio_cu), _parse_iso(chon.get("ket_thuc"))
+    thoi_luong = (kt_cu - bd_cu) if (bd_cu and kt_cu and kt_cu > bd_cu) \
+        else timedelta(minutes=THOI_LUONG_MAC_DINH_PHUT)
+    kt_moi = _parse_iso(gio_ket_thuc_moi_iso)
+    if not kt_moi or kt_moi <= bd_moi:
         kt_moi = bd_moi + thoi_luong
+
+    la_viec = chon.get("_nguon") != "google"
+    if la_viec:
         tasks_col.update_one({"_id": chon["_id"]}, {"$set": {
             "bat_dau": bd_moi.isoformat(), "ket_thuc": kt_moi.isoformat(),
             "deadline": bd_moi.isoformat(),
             "da_nhac_som": False, "da_nhac_sat": False,
         }})
-        # Dời luôn sự kiện trên Google Calendar (Google tự báo lại cho khách)
-        if chon.get("gg_event_id"):
-            gcal.doi_gio_su_kien(chon["gg_event_id"], bd_moi.isoformat(), kt_moi.isoformat())
-    except Exception:
-        tasks_col.update_one({"_id": chon["_id"]}, {"$set": {
-            "bat_dau": gio_moi_iso, "deadline": gio_moi_iso,
-            "da_nhac_som": False, "da_nhac_sat": False,
-        }})
 
-    # Báo người đặt lịch
-    gui_nguoi_dat(
-        chon.get("platform", "lark"), chon.get("chat_id", ""),
-        f"Dạ sếp muốn dời cuộc họp \"{chon.get('viec','')}\" sang {_fmt(gio_moi_iso)} ạ. "
-        f"Anh/chị sắp xếp lại giúp em nhé, em cảm ơn!"
-    )
-    # Xác nhận với sếp
+    # --- Cập nhật Google Calendar và KIỂM TRA kết quả ---
+    gg_ok, gg_txt = False, ""
+    if not (gcal.da_cau_hinh() and gcal.da_ket_noi()):
+        gg_txt = "\n⚠️ Bot chưa kết nối Google Calendar nên trên Google lịch chưa đổi."
+    elif chon.get("gg_event_id"):
+        kq = gcal.doi_gio_su_kien(chon["gg_event_id"], bd_moi.isoformat(), kt_moi.isoformat())
+        if kq.get("auth"):
+            _canh_bao_ket_noi("google", kq.get("error"))
+        if kq.get("success"):
+            gg_ok, gg_txt = True, "\n📅 Google Calendar đã cập nhật giờ mới."
+        elif kq.get("not_found") and la_viec:
+            # Sự kiện Google đã bị xoá tay -> tạo lại
+            tasks_col.update_one({"_id": chon["_id"]}, {"$unset": {"gg_event_id": ""},
+                                                        "$set": {"can_dong_bo_google": True}})
+            gg_txt = "\n⚠️ Sự kiện cũ trên Google đã bị xoá, em sẽ tạo lại theo giờ mới."
+        elif la_viec:
+            tasks_col.update_one({"_id": chon["_id"]}, {"$set": {"can_dong_bo_google": True}})
+            gg_txt = f"\n⚠️ Nhưng Google Calendar CHƯA đổi được ({_loi_ngan(kq)}), em sẽ tự thử lại."
+        else:
+            gg_txt = f"\n❌ Google Calendar báo lỗi ({_loi_ngan(kq)}), lịch CHƯA được dời."
+    elif la_viec and (chon.get("loai_viec") == "hop" or chon.get("nguoi_gui") == "Sếp"):
+        # Lịch họp / lịch sếp tự đặt chưa từng lên Google (lúc tạo bị lỗi/trùng giờ)
+        # -> đưa lên luôn theo giờ mới. (Việc deadline người ngoài gửi thì không đưa lên.)
+        tasks_col.update_one({"_id": chon["_id"]}, {"$set": {"can_dong_bo_google": True}})
+        gg_txt = "\n📅 Lịch này trước đó chưa lên Google, em sẽ đưa lên theo giờ mới."
+
+    if not la_viec and not gg_ok:
+        gui_sep(f"Dạ em CHƯA dời được \"{chon.get('viec','')}\" ạ.{gg_txt}")
+        return
+
+    if chon.get("tu_lark"):
+        gg_txt += ("\nℹ️ Lịch này gốc từ Lark Calendar, sếp sửa luôn trên Lark để 2 bên khớp nhau nhé "
+                   "(lần sau lịch trên Lark thay đổi sẽ ghi đè lên Google).")
+
+    # Báo người đặt lịch (nếu là lịch do người ngoài đặt)
+    bao_nguoi_dat = ""
+    if chon.get("chat_id"):
+        gui_nguoi_dat(
+            chon.get("platform", "lark"), chon.get("chat_id", ""),
+            f"Dạ sếp muốn dời cuộc họp \"{chon.get('viec','')}\" sang {_fmt(bd_moi.isoformat())} ạ. "
+            f"Anh/chị sắp xếp lại giúp em nhé, em cảm ơn!"
+        )
+        bao_nguoi_dat = f"\nVà đã báo lại cho {chon.get('nguoi_gui','người đặt')} rồi ạ."
     gui_sep(
-        f"✅ Dạ em đã dời cuộc họp \"{chon.get('viec','')}\"\n"
-        f"Từ: {_fmt(gio_cu)}\nSang: {_fmt(gio_moi_iso)}\n"
-        f"Và đã báo lại cho {chon.get('nguoi_gui','người đặt')} rồi ạ."
+        f"✅ Dạ em đã dời \"{chon.get('viec','')}\"\n"
+        f"Từ: {_fmt(gio_cu)}\nSang: {_fmt(bd_moi.isoformat())} – {_fmt(kt_moi.isoformat())}"
+        f"{gg_txt}{bao_nguoi_dat}"
     )
-    print(f"🔄 Đã dời lịch: {chon.get('viec','')} sang {gio_moi_iso}")
+    thu_lai_dong_bo_google()   # đưa ngay lên Google nếu vừa đánh dấu cần tạo lại
+    print(f"🔄 Đã dời lịch: {chon.get('viec','')} sang {bd_moi.isoformat()} (Google ok={gg_ok})")
 
 
 def _chon_lich_theo_mo_ta(mo_ta, ds):
@@ -826,7 +923,7 @@ def _chon_lich_theo_mo_ta(mo_ta, ds):
 
 def _huy_lich_hop(mo_ta):
     """Sếp hủy/xóa một lịch -> XÓA sự kiện Google Calendar + đánh dấu hủy + báo người đặt."""
-    ds = list(tasks_col.find({"hoan_thanh": False}))
+    ds = _ung_vien_lich()
     if not ds:
         gui_sep("Dạ hiện không có lịch nào để hủy ạ.")
         return
@@ -839,16 +936,33 @@ def _huy_lich_hop(mo_ta):
         gui_sep(f"Dạ em chưa rõ sếp muốn hủy lịch nào. Các lịch hiện có:\n{ds_txt}\nSếp nói rõ hơn giúp em ạ.")
         return
 
-    # Xóa sự kiện trên Google Calendar (nếu đã tạo)
-    da_xoa_google = False
-    if chon.get("gg_event_id") and gcal.da_cau_hinh() and gcal.da_ket_noi():
-        kq = gcal.huy_su_kien(chon["gg_event_id"])
-        da_xoa_google = bool(kq and kq.get("success"))
+    la_viec = chon.get("_nguon") != "google"
 
-    # Đánh dấu hủy để dừng nhắc (không xóa hẳn để còn lưu vết)
-    tasks_col.update_one({"_id": chon["_id"]},
-                         {"$set": {"hoan_thanh": True, "da_huy": True,
-                                   "da_nhac_som": True, "da_nhac_sat": True}})
+    # Xóa sự kiện trên Google Calendar (nếu đã tạo) và KIỂM TRA kết quả
+    gg_txt = ""
+    if chon.get("gg_event_id"):
+        if gcal.da_cau_hinh() and gcal.da_ket_noi():
+            kq = gcal.huy_su_kien(chon["gg_event_id"])
+            if kq.get("auth"):
+                _canh_bao_ket_noi("google", kq.get("error"))
+            if kq.get("success"):
+                gg_txt = "\n🗑️ Đã xóa khỏi Google Calendar."
+            else:
+                gg_txt = f"\n⚠️ Nhưng em CHƯA xóa được trên Google Calendar ({_loi_ngan(kq)}), sếp xóa tay giúp em nhé."
+        else:
+            gg_txt = "\n⚠️ Bot chưa kết nối Google Calendar nên sự kiện trên Google vẫn còn."
+        if not la_viec and not gg_txt.startswith("\n🗑️"):
+            gui_sep(f"Dạ em CHƯA hủy được \"{chon.get('viec','')}\" ạ.{gg_txt}")
+            return
+
+    if chon.get("tu_lark"):
+        gg_txt += "\nℹ️ Lịch này gốc từ Lark Calendar, sếp xóa luôn trên Lark để 2 bên khớp nhau nhé."
+
+    if la_viec:
+        # Đánh dấu hủy để dừng nhắc (không xóa hẳn để còn lưu vết)
+        tasks_col.update_one({"_id": chon["_id"]},
+                             {"$set": {"hoan_thanh": True, "da_huy": True, "can_dong_bo_google": False,
+                                       "da_nhac_som": True, "da_nhac_sat": True}})
 
     # Báo người đặt nếu là lịch do người ngoài đặt
     if chon.get("chat_id"):
@@ -856,7 +970,6 @@ def _huy_lich_hop(mo_ta):
             f"Dạ cuộc họp \"{chon.get('viec','')}\" lúc "
             f"{_fmt(chon.get('bat_dau', chon.get('deadline','')))} đã được hủy ạ. Em cảm ơn anh/chị!")
 
-    gg_txt = "\n🗑️ Đã xóa khỏi Google Calendar." if da_xoa_google else ""
     gui_sep(f"✅ Dạ em đã hủy lịch \"{chon.get('viec','')}\" "
             f"({_fmt(chon.get('bat_dau', chon.get('deadline','')))}) rồi ạ.{gg_txt}")
     print(f"🗑️ Đã hủy lịch: {chon.get('viec','')}")
@@ -890,6 +1003,7 @@ def _tra_loi_du_lieu(cau_hoi):
         evs = gcal.liet_ke_su_kien(
             tu_iso=(now - timedelta(days=14)).isoformat(),
             den_iso=(now + timedelta(days=60)).isoformat(),
+            bao_loi=True,
         )
         if evs:
             lich_txt = "\n".join(
@@ -897,10 +1011,15 @@ def _tra_loi_du_lieu(cau_hoi):
                 + (f" @ {e.get('location')}" if e.get('location') else "")
                 for e in evs
             )
-        elif gcal.da_ket_noi():
-            lich_txt = "(không có sự kiện nào trong khoảng 14 ngày trước → 30 ngày tới)"
+        else:
+            lich_txt = "(không có sự kiện nào trong khoảng 14 ngày trước → 60 ngày tới)"
     except Exception as e:
+        # KHÔNG được coi lỗi là 'không có lịch' -> báo rõ để GPT nói thật với sếp
         print(f"⚠️ Lỗi đọc lịch Google cho câu hỏi sếp: {e}")
+        if isinstance(e, gcal.LoiXacThucGoogle):
+            _canh_bao_ket_noi("google", e)
+        lich_txt = ("(LỖI: em không đọc được Google Calendar lúc này, KHÔNG biết sếp có lịch gì. "
+                    "Hãy nói rõ với sếp là đang lỗi kết nối lịch.)")
 
     thu = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"][now.weekday()]
     system = (
@@ -930,6 +1049,88 @@ def _tra_loi_du_lieu(cau_hoi):
     except Exception as e:
         print(f"⚠️ Lỗi trả lời dữ liệu: {e}")
         return "Dạ em chưa lấy được dữ liệu, sếp thử lại sau nhé ạ."
+
+
+# ==================== ĐỒNG BỘ: LARK -> GOOGLE + THỬ LẠI LỊCH CHƯA LÊN GOOGLE ====================
+def thu_lai_dong_bo_google():
+    """Việc có can_dong_bo_google=True (tạo/dời trên Google từng lỗi, hoặc lúc đó chưa kết nối)
+    -> thử lại: có gg_event_id thì dời giờ, chưa có thì tạo mới. Trước đây bot chỉ NÓI
+    'em sẽ thử lại' chứ không có cơ chế thử lại nào."""
+    if not (gcal.da_cau_hinh() and gcal.da_ket_noi()):
+        return
+    now = datetime.now(VN_TZ)
+    for v in tasks_col.find({"can_dong_bo_google": True, "hoan_thanh": False}).limit(20):
+        bd = _parse_iso(v.get("bat_dau") or v.get("deadline"))
+        if not bd or bd < now or v.get("so_lan_thu_google", 0) >= 10:
+            tasks_col.update_one({"_id": v["_id"]}, {"$set": {"can_dong_bo_google": False}})
+            if bd and bd >= now:
+                gui_sep(f"⚠️ Em thử nhiều lần vẫn chưa đưa được \"{v.get('viec','')}\" "
+                        f"({_fmt(bd.isoformat())}) lên Google Calendar, sếp thêm tay giúp em nhé ạ.")
+            continue
+        # Khoá 2 phút chống 2 luồng cùng tạo 1 sự kiện
+        khoa = tasks_col.update_one(
+            {"_id": v["_id"], "$or": [{"dang_thu_google": {"$lt": datetime.now(timezone.utc)}},
+                                      {"dang_thu_google": {"$exists": False}}]},
+            {"$set": {"dang_thu_google": datetime.now(timezone.utc) + timedelta(minutes=2)}},
+        )
+        if khoa.modified_count == 0:
+            continue
+        kt = _parse_iso(v.get("ket_thuc"))
+        if not kt or kt <= bd:
+            kt = bd + timedelta(minutes=THOI_LUONG_MAC_DINH_PHUT)
+        email = v.get("email_nguoi_dat")
+        kq = {"not_found": True}
+        if v.get("gg_event_id"):
+            kq = gcal.doi_gio_su_kien(v["gg_event_id"], bd.isoformat(), kt.isoformat())
+            if kq.get("not_found"):   # sự kiện Google đã bị xoá tay -> tạo lại luôn
+                tasks_col.update_one({"_id": v["_id"]}, {"$unset": {"gg_event_id": ""}})
+                v.pop("gg_event_id")
+        if kq.get("not_found"):
+            mo_ta = (f"Người đặt lịch: {v.get('nguoi_gui')} (qua {v.get('platform')}) - {email}"
+                     if email else "Sếp tự đặt qua trợ lý")
+            kq = gcal.tao_su_kien(v.get("viec", ""), bd.isoformat(), kt.isoformat(),
+                                  description=mo_ta, attendee_email=email,
+                                  check_trung=False, tao_meet=True)
+        if kq.get("success"):
+            upd = {"can_dong_bo_google": False}
+            if kq.get("event_id"):
+                upd.update({"gg_event_id": kq["event_id"], "gg_event_link": kq.get("link")})
+            tasks_col.update_one({"_id": v["_id"]}, {"$set": upd, "$unset": {"dang_thu_google": ""}})
+            gui_sep(f"📅 Em đã đưa \"{v.get('viec','')}\" ({_fmt(bd.isoformat())}) "
+                    f"lên Google Calendar rồi ạ." + (f" Đã mời {email}." if email and not v.get("gg_event_id") else ""))
+            print(f"🔁 Thử lại Google OK: {v.get('viec')}")
+        else:
+            tasks_col.update_one({"_id": v["_id"]}, {"$inc": {"so_lan_thu_google": 1},
+                                                     "$unset": {"dang_thu_google": ""}})
+            print(f"⚠️ Thử lại Google vẫn lỗi ({v.get('viec')}): {kq.get('error')}")
+            if kq.get("auth"):
+                _canh_bao_ket_noi("google", kq.get("error"))
+                break   # token hỏng thì thử tiếp cũng vô ích
+
+
+def dong_bo_lark_sang_google():
+    """Lấy thay đổi trên Lark Calendar (sếp sửa thẳng trên giao diện Lark) -> áp lên Google.
+    Gọi từ: webhook calendar.calendar.event.changed_v4, /nhac, luồng nền."""
+    try:
+        kq = lark_cal.dong_bo()
+        if kq.get("bo_qua"):
+            print(f"ℹ️ Bỏ qua đồng bộ Lark->Google: {kq['bo_qua']}")
+        return kq
+    except lark_cal.LoiXacThucLark as e:
+        _canh_bao_ket_noi("lark", e)
+    except gcal.LoiXacThucGoogle as e:
+        _canh_bao_ket_noi("google", e)
+    except Exception as e:
+        print(f"⚠️ Lỗi đồng bộ Lark->Google: {e}")
+    return None
+
+
+def dong_bo_lich():
+    try:
+        thu_lai_dong_bo_google()
+    except Exception as e:
+        print(f"⚠️ Lỗi thử lại đồng bộ Google: {e}")
+    dong_bo_lark_sang_google()
 
 
 # ==================== NHẮC DEADLINE (logic 2 lần, không lọt) ====================
@@ -982,6 +1183,10 @@ def nhac_deadline():
                 gui_sep(_soan_loi_nhac(v, con_phut, "som"))
                 print(f"🔔 Nhắc SỚM: {v['viec']}")
 
+    # Đồng bộ Lark -> Google + thử lại lịch chưa lên Google TRƯỚC khi nhắc,
+    # để lời nhắc dùng giờ mới nhất
+    dong_bo_lich()
+
     # Nhắc luôn các cuộc họp trên Google Calendar (lịch sếp tự thêm, không tạo qua bot)
     try:
         nhac_lich_google()
@@ -1014,7 +1219,8 @@ def nhac_lich_google():
         con = int((bd - now).total_seconds() / 60)
         if con < 0:            # đã bắt đầu -> bỏ
             continue
-        khoa = e.get("id") or f"{start}|{e.get('summary','')}"
+        # Khoá gồm cả giờ bắt đầu: lịch bị dời sang giờ khác thì vẫn được nhắc lại
+        khoa = f"{e.get('id') or e.get('summary','')}|{start}"
         # Khóa atomic: chỉ nhắc nếu chưa từng nhắc event này
         locked = reminded_events_col.update_one(
             {"_id": khoa},
@@ -1107,17 +1313,21 @@ def _soan_bao_cao(sys):
     try:
         dau_ngay = now.replace(hour=0, minute=0, second=0, microsecond=0)
         cuoi_ngay = now.replace(hour=23, minute=59, second=59, microsecond=0)
-        evs = gcal.liet_ke_su_kien(tu_iso=dau_ngay.isoformat(), den_iso=cuoi_ngay.isoformat())
+        evs = gcal.liet_ke_su_kien(tu_iso=dau_ngay.isoformat(), den_iso=cuoi_ngay.isoformat(),
+                                   bao_loi=True)
         if evs:
             lich_hom_nay = "\n".join(
                 f"- {_fmt(e.get('start',''))}: {e.get('summary','')}"
                 + (f" @ {e.get('location')}" if e.get('location') else "")
                 for e in evs
             )
-        elif gcal.da_ket_noi():
+        else:
             lich_hom_nay = "(hôm nay không có lịch nào trên Google Calendar)"
     except Exception as e:
         print(f"⚠️ Lỗi đọc lịch Google cho báo cáo sáng: {e}")
+        if isinstance(e, gcal.LoiXacThucGoogle):
+            _canh_bao_ket_noi("google", e)
+        lich_hom_nay = "(LỖI: không đọc được Google Calendar, cần báo sếp là chưa lấy được lịch hôm nay)"
 
     if not client:
         return f"📋 Báo cáo sáng:\nLịch hôm nay:\n{lich_hom_nay}\n\nViệc đang chờ:\n{viec_txt}"
@@ -1170,7 +1380,11 @@ def api_xu_ly():
         except Exception as e:
             print(f"⚠️ Lỗi xử lý nền: {e}")
 
-    threading.Thread(target=_xu_ly_nen, daemon=True).start()
+    if CHAY_NEN:
+        threading.Thread(target=_xu_ly_nen, daemon=True).start()
+    else:
+        # Serverless (Vercel): thread nền bị đóng băng sau khi trả response -> xử lý luôn
+        _xu_ly_nen()
     return jsonify({"ok": True})
 
 
@@ -1231,13 +1445,66 @@ def oauth2callback():
 
 @app.route("/trang-thai-google")
 def trang_thai_google():
-    """Kiểm tra nhanh bot đã kết nối Google chưa."""
+    """Kiểm tra nhanh bot đã kết nối Google chưa — thử lấy token THẬT (token hết hạn
+    vẫn 'da_ket_noi'=true vì còn lưu trong Mongo, nên phải xem 'token_dung_duoc')."""
+    ok, loi = gcal.kiem_tra_ket_noi()
     return jsonify({
         "da_cau_hinh": gcal.da_cau_hinh(),
         "da_ket_noi": gcal.da_ket_noi(),
+        "token_dung_duoc": ok,
+        "loi_token": loi,
         "user": gcal.GOOGLE_CAL_USER,
         "calendar_id": gcal.CALENDAR_ID,
+        "so_viec_cho_dua_len_google": tasks_col.count_documents(
+            {"can_dong_bo_google": True, "hoan_thanh": False}),
     })
+
+
+# ==================== LARK CALENDAR (sếp cấp quyền 1 lần để bot đọc lịch Lark) ====================
+@app.route("/auth-lark")
+def auth_lark():
+    """Sếp mở link này 1 LẦN (đăng nhập bằng tài khoản Lark của sếp) để bot đọc được
+    Lark Calendar và tự đồng bộ các thay đổi sang Google Calendar."""
+    if not lark_cal.da_cau_hinh():
+        return "❌ Thiếu LARK_APP_ID / LARK_APP_SECRET / LARK_REDIRECT_URI", 500
+    return redirect(lark_cal.auth_url(request.args.get("user")))
+
+
+@app.route("/lark-oauth-callback")
+def lark_oauth_callback():
+    err = request.args.get("error")
+    if err:
+        return f"❌ Lark từ chối: {err}", 400
+    code = request.args.get("code")
+    user = request.args.get("state") or lark_cal.LARK_CAL_USER
+    if not code:
+        return "❌ Thiếu code từ Lark", 400
+    try:
+        lark_cal.doi_code_lay_token(code, user, open_id_cho_phep=BOSS_OPEN_ID)
+    except Exception as e:
+        return f"❌ Lỗi kết nối Lark Calendar: {e}", 500
+    try:
+        ok_wh, _ = lark_cal.dang_ky_nhan_thay_doi(user)
+    except Exception as e:
+        ok_wh = False
+        print(f"⚠️ Lỗi đăng ký webhook lịch Lark: {e}")
+    kq = dong_bo_lark_sang_google() or {}
+    return (
+        "✅ Đã kết nối Lark Calendar! Từ giờ sếp sửa lịch trên Lark, em sẽ tự cập nhật sang Google Calendar.<br>"
+        f"Webhook thay đổi lịch: {'đã bật' if ok_wh else 'CHƯA bật được (vẫn đồng bộ theo cron)'}<br>"
+        f"Lần đồng bộ đầu: {json.dumps({k: v for k, v in kq.items()}, ensure_ascii=False, default=str)}"
+    )
+
+
+@app.route("/trang-thai-lark")
+def trang_thai_lark():
+    return jsonify(lark_cal.trang_thai())
+
+
+@app.route("/dong-bo-lark", methods=["GET", "POST"])
+def api_dong_bo_lark():
+    """Chạy đồng bộ Lark -> Google ngay (để kiểm tra thủ công)."""
+    return jsonify(dong_bo_lark_sang_google() or {"loi": "xem log"})
 
 
 @app.route("/", methods=["GET"])
@@ -1253,7 +1520,7 @@ def vong_lap_nhac():
     while True:
         try:
             print(f"🕐 Quét định kỳ lúc {datetime.now(VN_TZ)}")
-            nhac_deadline()
+            nhac_deadline()   # đã gồm đồng bộ Lark -> Google + thử lại Google
             kiem_tra_bao_cao_hang_ngay()
         except Exception as e:
             print(f"⚠️ Lỗi luồng nền: {e}")
@@ -1306,6 +1573,7 @@ def vong_lap_quet_tin():
 
 
 # Khởi động luồng nền ngay khi app load (chạy cả với gunicorn)
+CHAY_NEN = os.environ.get("CHAY_NEN", "1") == "1"
 _thread_started = False
 def _start_background():
     global _thread_started
@@ -1334,7 +1602,7 @@ def _start_background():
 # Chỉ chạy luồng nền khi host LUÔN BẬT (VM/Oracle/máy nhà/Koyeb-giữ-thức).
 # Trên Vercel serverless: đặt CHAY_NEN=0 -> KHÔNG chạy nền (tránh khởi động lại
 # change stream + dọn backlog mỗi lần cold start). Webhook sẽ xử lý đồng bộ.
-if os.environ.get("CHAY_NEN", "1") == "1":
+if CHAY_NEN:
     _start_background()
 
 
